@@ -1,28 +1,25 @@
 import {
-  ProgramAccount,
-  Market,
+  MarginAccount,
   ParclV3Sdk,
+  ProgramAccount,
   getExchangePda,
-  getMarketPda,
-  MarginAccountWrapper,
-  MarketWrapper,
-  ExchangeWrapper,
-  LiquidateAccounts,
-  LiquidateParams,
-  MarketMap,
-  PriceFeedMap,
-  Address,
   translateAddress,
 } from "@parcl-oss/v3-sdk";
 import {
   Commitment,
   Connection,
   Keypair,
-  PublicKey,
-  Signer,
-  sendAndConfirmTransaction,
 } from "@solana/web3.js";
 import bs58 from "bs58";
+import { RunLiquidatorParams } from "./types";
+import { 
+  getAllMarketAddressesByExchange, 
+  getMarketAccountsByExchange, 
+  getMarketMapAndPriceFeedMap, 
+  scanAndLiquidateMarginAccounts, 
+  createMarginAccountsDataFrame,
+  getMarginAccountsAtBoundedMarginLevels,
+} from "./utils";
 import * as dotenv from "dotenv";
 dotenv.config();
 
@@ -41,174 +38,96 @@ dotenv.config();
   const [exchangeAddress] = getExchangePda(0);
   const liquidatorMarginAccount = translateAddress(process.env.LIQUIDATOR_MARGIN_ACCOUNT);
   const liquidatorSigner = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
-  const interval = parseInt(process.env.INTERVAL ?? "300");
+  const priceFeedsUpdateInterval = parseInt(process.env.PRICE_FEEDS_UPDATE_INTERVAL ?? "30");
+  const allMarginAccountsScanInterval = parseInt(process.env.ALL_MARGIN_ACCOUNTS_SCAN_INTERVAL ?? "300");
   const commitment = process.env.COMMITMENT as Commitment | undefined;
   const sdk = new ParclV3Sdk({ rpcUrl: process.env.RPC_URL, commitment });
   const connection = new Connection(process.env.RPC_URL, commitment);
   await runLiquidator({
     sdk,
     connection,
-    interval,
+    priceFeedsUpdateInterval,
+    allMarginAccountsScanInterval,
     exchangeAddress,
     liquidatorSigner,
     liquidatorMarginAccount,
   });
 })();
 
-type RunLiquidatorParams = {
-  sdk: ParclV3Sdk;
-  connection: Connection;
-  interval: number;
-  exchangeAddress: Address;
-  liquidatorSigner: Keypair;
-  liquidatorMarginAccount: Address;
-};
-
-async function runLiquidator({
+export async function runLiquidator({
   sdk,
   connection,
-  interval,
+  priceFeedsUpdateInterval,
+  allMarginAccountsScanInterval,
   exchangeAddress,
   liquidatorSigner,
   liquidatorMarginAccount,
 }: RunLiquidatorParams): Promise<void> {
-  let firstRun = true;
+
+  // Initial Price Feed Read In
+  console.log("Scanning Latest Prices");
+  let [exchange, markets, priceFeeds] = await getMarketAccountsByExchange(sdk, exchangeAddress);
+  let timePriceFeedsLastUpdated = performance.now();
+  
+  // Margin Account DataFrames
+  console.log("Full Margin Account Scan");
+  let allMarginAccounts = await sdk.accountFetcher.getAllMarginAccounts();
+  let allMarginAccountsDataFrame = createMarginAccountsDataFrame(allMarginAccounts, exchange, markets, priceFeeds);
+  let priorityMarginAccountsDataFrame = getMarginAccountsAtBoundedMarginLevels(allMarginAccountsDataFrame, 0, 1.1e+16);
+  let allMarginAccountAddresses = allMarginAccountsDataFrame.getColumn("addresses").toArray();
+  let priorityMarginAccounts: (ProgramAccount<MarginAccount> | undefined)[];
+  priorityMarginAccounts = allMarginAccounts.filter((marginAccount) => allMarginAccountAddresses.includes(marginAccount.address));
+  let timeAllMarginAccountsLastScanned = performance.now();
+
+  allMarginAccountsDataFrame.writeCSV(`./data/All-Margin-Accounts-${Date.now()/1000}.csv`);
+  priorityMarginAccountsDataFrame.writeCSV(`./data/Priority-Margin-Accounts-${Date.now()/1000}.csv`);
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    if (firstRun) {
-      firstRun = false;
-    } else {
-      await new Promise((resolve) => setTimeout(resolve, interval * 1000));
-    }
-    const exchange = await sdk.accountFetcher.getExchange(exchangeAddress);
-    if (exchange === undefined) {
-      throw new Error("Invalid exchange address");
-    }
-    const allMarketAddresses: PublicKey[] = [];
-    for (const marketId of exchange.marketIds) {
-      if (marketId === 0) {
-        continue;
-      }
-      const [market] = getMarketPda(exchangeAddress, marketId);
-      allMarketAddresses.push(market);
-    }
-    const allMarkets = await sdk.accountFetcher.getMarkets(allMarketAddresses);
-    const [[markets, priceFeeds], allMarginAccounts] = await Promise.all([
-      getMarketMapAndPriceFeedMap(sdk, allMarkets),
-      sdk.accountFetcher.getAllMarginAccounts(),
-    ]);
-    console.log(`Fetched ${allMarginAccounts.length} margin accounts`);
-    for (const rawMarginAccount of allMarginAccounts) {
-      const marginAccount = new MarginAccountWrapper(
-        rawMarginAccount.account,
-        rawMarginAccount.address
-      );
-      if (marginAccount.inLiquidation()) {
-        console.log(`Liquidating account already in liquidation (${marginAccount.address})`);
-        await liquidate(
-          sdk,
-          connection,
-          marginAccount,
-          {
-            marginAccount: rawMarginAccount.address,
-            exchange: rawMarginAccount.account.exchange,
-            owner: rawMarginAccount.account.owner,
-            liquidator: liquidatorSigner.publicKey,
-            liquidatorMarginAccount,
-          },
-          markets,
-          [liquidatorSigner],
-          liquidatorSigner.publicKey
-        );
-      }
-      const margins = marginAccount.getAccountMargins(
-        new ExchangeWrapper(exchange),
-        markets,
-        priceFeeds,
-        Math.floor(Date.now() / 1000)
-      );
-      if (margins.canLiquidate()) {
-        console.log(`Starting liquidation for ${marginAccount.address}`);
-        const signature = await liquidate(
-          sdk,
-          connection,
-          marginAccount,
-          {
-            marginAccount: rawMarginAccount.address,
-            exchange: rawMarginAccount.account.exchange,
-            owner: rawMarginAccount.account.owner,
-            liquidator: liquidatorSigner.publicKey,
-            liquidatorMarginAccount,
-          },
-          markets,
-          [liquidatorSigner],
-          liquidatorSigner.publicKey
-        );
-        console.log("Signature: ", signature);
-      }
-    }
-  }
-}
 
-async function getMarketMapAndPriceFeedMap(
-  sdk: ParclV3Sdk,
-  allMarkets: (ProgramAccount<Market> | undefined)[]
-): Promise<[MarketMap, PriceFeedMap]> {
-  const markets: MarketMap = {};
-  for (const market of allMarkets) {
-    if (market === undefined) {
-      continue;
-    }
-    markets[market.account.id] = new MarketWrapper(market.account, market.address);
-  }
-  const allPriceFeedAddresses = (allMarkets as ProgramAccount<Market>[]).map(
-    (market) => market.account.priceFeed
-  );
-  const allPriceFeeds = await sdk.accountFetcher.getPythPriceFeeds(allPriceFeedAddresses);
-  const priceFeeds: PriceFeedMap = {};
-  for (let i = 0; i < allPriceFeeds.length; i++) {
-    const priceFeed = allPriceFeeds[i];
-    if (priceFeed === undefined) {
-      continue;
-    }
-    priceFeeds[allPriceFeedAddresses[i]] = priceFeed;
-  }
-  return [markets, priceFeeds];
-}
+    // price feeds
+    if (performance.now() - timePriceFeedsLastUpdated >= priceFeedsUpdateInterval * 1000) {
+      console.log("Price Feed Update Routine");
+      let priceFeedRoutineStart = performance.now();
 
-function getMarketsAndPriceFeeds(
-  marginAccount: MarginAccountWrapper,
-  markets: MarketMap
-): [Address[], Address[]] {
-  const marketAddresses: Address[] = [];
-  const priceFeedAddresses: Address[] = [];
-  for (const position of marginAccount.positions()) {
-    const market = markets[position.marketId()];
-    if (market.address === undefined) {
-      throw new Error(`Market is missing from markets map (id=${position.marketId()})`);
-    }
-    marketAddresses.push(market.address);
-    priceFeedAddresses.push(market.priceFeed());
-  }
-  return [marketAddresses, priceFeedAddresses];
-}
+      // update price feeds
+      const allMarketAddresses = getAllMarketAddressesByExchange(exchangeAddress, exchange);
+      const allMarkets = await sdk.accountFetcher.getMarkets(allMarketAddresses);
+      [markets, priceFeeds] = await getMarketMapAndPriceFeedMap(sdk, allMarkets);
 
-async function liquidate(
-  sdk: ParclV3Sdk,
-  connection: Connection,
-  marginAccount: MarginAccountWrapper,
-  accounts: LiquidateAccounts,
-  markets: MarketMap,
-  signers: Signer[],
-  feePayer: Address,
-  params?: LiquidateParams
-): Promise<string> {
-  const [marketAddresses, priceFeedAddresses] = getMarketsAndPriceFeeds(marginAccount, markets);
-  const { blockhash: recentBlockhash } = await connection.getLatestBlockhash();
-  const tx = sdk
-    .transactionBuilder()
-    .liquidate(accounts, marketAddresses, priceFeedAddresses, params)
-    .feePayer(feePayer)
-    .buildSigned(signers, recentBlockhash);
-  return await sendAndConfirmTransaction(connection, tx, signers);
+      priorityMarginAccounts = await sdk.accountFetcher.getMarginAccounts(priorityMarginAccountsDataFrame.getColumn("addresses").toArray());
+      priorityMarginAccountsDataFrame = createMarginAccountsDataFrame(priorityMarginAccounts, exchange, markets, priceFeeds); 
+      priorityMarginAccountsDataFrame = getMarginAccountsAtBoundedMarginLevels(priorityMarginAccountsDataFrame, 0, 1.1e+16);
+      let priorityMarginAccountAddresses = priorityMarginAccountsDataFrame.getColumn("addresses").toArray();
+      priorityMarginAccounts = priorityMarginAccounts.filter((marginAccount) => priorityMarginAccountAddresses.includes(marginAccount?.address));
+      await scanAndLiquidateMarginAccounts(sdk, connection, priorityMarginAccounts, markets, priceFeeds, exchange, liquidatorSigner, liquidatorMarginAccount);
+      console.log(`Scanned ${priorityMarginAccounts.length} priority margin accounts.`);
+      timePriceFeedsLastUpdated = performance.now();
+      console.log(`Price Feed Update Routine took ${timePriceFeedsLastUpdated - priceFeedRoutineStart} milliseconds.`);
+    }
+
+    // allMarginAccounts
+    if (performance.now() - timeAllMarginAccountsLastScanned >= allMarginAccountsScanInterval * 1000) {
+      console.log("Full Margin Account Scan Routine");
+      let allMarginAccountsRoutineStart = performance.now();
+
+      allMarginAccounts = await sdk.accountFetcher.getAllMarginAccounts();
+      allMarginAccountsDataFrame = createMarginAccountsDataFrame(allMarginAccounts, exchange, markets, priceFeeds);
+      priorityMarginAccountsDataFrame = getMarginAccountsAtBoundedMarginLevels(allMarginAccountsDataFrame, 0, 1.1e+16);
+      allMarginAccountAddresses = allMarginAccountsDataFrame.getColumn("addresses").toArray();
+      priorityMarginAccounts = allMarginAccounts.filter((marginAccount) => allMarginAccountAddresses.includes(marginAccount.address));
+
+      allMarginAccountsDataFrame.writeCSV(`./data/All-Margin-Accounts-${Date.now()/1000}.csv`);
+      priorityMarginAccountsDataFrame.writeCSV(`./data/Priority-Margin-Accounts-${Date.now()/1000}.csv`);
+
+      timeAllMarginAccountsLastScanned = performance.now();
+
+      console.log(`Scanned ${priorityMarginAccounts.length} margin accounts`);
+      console.log(`Full Margin Account Scan routine took ${timeAllMarginAccountsLastScanned - allMarginAccountsRoutineStart} milliseconds`);
+    }
+
+    // sleep for a second
+    console.log("Waiting a second");
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
 }
