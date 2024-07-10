@@ -24,6 +24,7 @@ export function createMarginAccountsDataFrame(
   let numberOfPositions: number[] = [];
   let marginAmounts: number[] = [];
   let availableMargins: number[] = [];
+  let inLiquidations: boolean[] = [];
   let PnLs: number[] = [];
   for (const rawMarginAccount of rawMarginAccounts) {
     if (rawMarginAccount) {
@@ -40,6 +41,7 @@ export function createMarginAccountsDataFrame(
       if (margins.totalRequiredMargin().isZero()) {
         continue;
       }
+
       let totalPnl = PreciseIntWrapper.zero();
       for (const position of marginAccount.positions()) {
         const market = markets[position.marketId()];
@@ -55,6 +57,7 @@ export function createMarginAccountsDataFrame(
       const availableMargin = marginAccount.margin(exchange.collateralExpo).add(totalPnl);
       let marginLevel = availableMargin.div(margins.totalRequiredMargin());
       PnLs.push(totalPnl.val.toNumber());
+      inLiquidations.push(marginAccount.inLiquidation());
       availableMargins.push(availableMargin.val.toNumber());
       marginLevels.push(marginLevel.val.toNumber());
       numberOfPositions.push(marginAccount.positions().length);
@@ -65,6 +68,7 @@ export function createMarginAccountsDataFrame(
   }
   return pl.DataFrame({
     "addresses": marginAccountAddresses,
+    "inLiquidations": inLiquidations,
     "PnLs": PnLs,
     "numberOfPositions": numberOfPositions,
     "availableMargins": availableMargins,
