@@ -24,6 +24,7 @@ export function createMarginAccountsDataFrame(
   let numberOfPositions: number[] = [];
   let marginAmounts: number[] = [];
   let availableMargins: number[] = [];
+  let PnLs: number[] = [];
   for (const rawMarginAccount of rawMarginAccounts) {
     if (rawMarginAccount) {
       const marginAccount = new MarginAccountWrapper(
@@ -53,6 +54,7 @@ export function createMarginAccountsDataFrame(
       }
       const availableMargin = marginAccount.margin(exchange.collateralExpo).add(totalPnl);
       let marginLevel = availableMargin.div(margins.totalRequiredMargin());
+      PnLs.push(totalPnl.val.toNumber());
       availableMargins.push(availableMargin.val.toNumber());
       marginLevels.push(marginLevel.val.toNumber());
       numberOfPositions.push(marginAccount.positions().length);
@@ -63,6 +65,7 @@ export function createMarginAccountsDataFrame(
   }
   return pl.DataFrame({
     "addresses": marginAccountAddresses,
+    "PnLs": PnLs,
     "numberOfPositions": numberOfPositions,
     "availableMargins": availableMargins,
     "totalRequiredMargins": totalRequiredMargins,
